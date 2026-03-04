@@ -7,14 +7,20 @@ Artifact Registry, GKE cluster, and optional accelerator node pools.
 import pulumi
 import pulumi_gcp as gcp
 
-from keras_remote.cli.constants import REQUIRED_APIS, RESOURCE_NAME_PREFIX
+from keras_remote.cli.constants import (
+  MAX_CLUSTER_CPU,
+  MAX_CLUSTER_MEMORY_GB,
+  NODE_MAX_RUN_DURATION_SECONDS,
+  REQUIRED_APIS,
+  RESOURCE_NAME_PREFIX,
+)
 from keras_remote.constants import zone_to_ar_location, zone_to_region
 from keras_remote.core.accelerators import GpuConfig, TpuConfig
 
 # OAuth scopes required by all node pools (including accelerator pools).
 _BASE_OAUTH_SCOPES = [
   # Read/write access to GCS for storing checkpoints, datasets, and logs.
-  "https://www.googleapis.com/auth/devstorage.full_control",
+  "https://www.googleapis.com/auth/devstorage.read_write",
   # Write application logs to Cloud Logging.
   "https://www.googleapis.com/auth/logging.write",
   # Export metrics to Cloud Monitoring.
@@ -112,6 +118,27 @@ def create_program(config):
         channel="UNSPECIFIED",
       ),
       deletion_protection=False,
+      cluster_autoscaling=gcp.container.ClusterClusterAutoscalingArgs(
+        enabled=True,
+        autoscaling_profile="OPTIMIZE_UTILIZATION",
+        auto_provisioning_defaults=gcp.container.ClusterClusterAutoscalingAutoProvisioningDefaultsArgs(
+          oauth_scopes=_DEFAULT_POOL_OAUTH_SCOPES,
+          management=gcp.container.ClusterClusterAutoscalingAutoProvisioningDefaultsManagementArgs(
+            auto_upgrade=True,
+            auto_repair=True,
+          ),
+        ),
+        resource_limits=[
+          gcp.container.ClusterClusterAutoscalingResourceLimitArgs(
+            resource_type="cpu",
+            maximum=MAX_CLUSTER_CPU,
+          ),
+          gcp.container.ClusterClusterAutoscalingResourceLimitArgs(
+            resource_type="memory",
+            maximum=MAX_CLUSTER_MEMORY_GB,
+          ),
+        ],
+      ),
       opts=pulumi.ResourceOptions(depends_on=enabled_apis),
     )
 
@@ -190,7 +217,15 @@ def _create_gpu_node_pool(cluster, gpu: GpuConfig, zone, project_id, pool_name):
     cluster=cluster.name,
     location=zone,
     project=project_id,
-    node_count=1,
+    initial_node_count=0,
+    autoscaling=gcp.container.NodePoolAutoscalingArgs(
+      min_node_count=0,
+      max_node_count=10,
+    ),
+    management=gcp.container.NodePoolManagementArgs(
+      auto_repair=True,
+      auto_upgrade=True,
+    ),
     node_config=gcp.container.NodePoolNodeConfigArgs(
       machine_type=gpu.machine_type,
       oauth_scopes=_BASE_OAUTH_SCOPES,
@@ -201,6 +236,7 @@ def _create_gpu_node_pool(cluster, gpu: GpuConfig, zone, project_id, pool_name):
         ),
       ],
       labels={RESOURCE_NAME_PREFIX: "true"},
+      max_run_duration=f"{NODE_MAX_RUN_DURATION_SECONDS}s",  # 24 hours
     ),
   )
 
@@ -209,12 +245,15 @@ def _create_tpu_node_pool(cluster, tpu: TpuConfig, zone, project_id, pool_name):
   """Create a TPU GKE node pool."""
   # Single-host TPU slices (1 node) must not specify placement_policy;
   # multi-host slices require COMPACT placement with an explicit topology.
+  is_multi_host = tpu.num_nodes > 1
+  min_nodes = tpu.num_nodes if is_multi_host else 0
+
   placement = (
     gcp.container.NodePoolPlacementPolicyArgs(
       type="COMPACT",
       tpu_topology=tpu.topology,
     )
-    if tpu.num_nodes > 1
+    if is_multi_host
     else None
   )
   return gcp.container.NodePool(
@@ -223,11 +262,20 @@ def _create_tpu_node_pool(cluster, tpu: TpuConfig, zone, project_id, pool_name):
     cluster=cluster.name,
     location=zone,
     project=project_id,
-    node_count=tpu.num_nodes,
+    initial_node_count=min_nodes,
+    autoscaling=gcp.container.NodePoolAutoscalingArgs(
+      min_node_count=min_nodes,
+      max_node_count=tpu.num_nodes,
+    ),
+    management=gcp.container.NodePoolManagementArgs(
+      auto_repair=True,
+      auto_upgrade=True,
+    ),
     node_config=gcp.container.NodePoolNodeConfigArgs(
       machine_type=tpu.machine_type,
       oauth_scopes=_BASE_OAUTH_SCOPES,
       labels={RESOURCE_NAME_PREFIX: "true"},
+      max_run_duration=f"{NODE_MAX_RUN_DURATION_SECONDS}s",  # 24 hours
     ),
     placement_policy=placement,
   )

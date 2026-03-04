@@ -1,5 +1,8 @@
 """GKE job submission for keras_remote."""
 
+import functools
+import json
+import subprocess
 import time
 from contextlib import suppress
 
@@ -108,6 +111,7 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
   job_name = job.metadata.name
   start_time = time.time()
   logged_running = False
+  logged_pending = set()
 
   with LogStreamer(core_v1, namespace) as streamer:
     while True:
@@ -133,7 +137,7 @@ def wait_for_job(job, namespace="default", timeout=3600, poll_interval=10):
         raise RuntimeError(f"GKE job {job_name} failed")
 
       # Check for pod scheduling issues
-      _check_pod_scheduling(core_v1, job_name, namespace)
+      _check_pod_scheduling(core_v1, job_name, namespace, logged_pending)
 
       # Start log streaming when pod is running
       with suppress(ApiException):
@@ -209,11 +213,10 @@ def validate_preflight(
 
     if not nodes.items:
       selector_str = ", ".join([f"{k}: {v}" for k, v in node_selector.items()])
-      raise RuntimeError(
-        f"Preflight check failed: No nodes match the accelerator selector: {selector_str}. "
-        "Check that your GKE cluster has a node pool with the correct accelerator type. "
-        "See all supported accelerator symbols here: \n"
-        "https://github.com/keras-team/remote#supported-accelerators"
+      logging.info(
+        "Preflight check: No currently running nodes match selector: %s. "
+        "Proceeding under the assumption that the cluster will auto-provision with scale-to-zero enabled.",
+        selector_str,
       )
   except ApiException as e:
     # If we can't list nodes due to permissions, log a warning but proceed
@@ -396,35 +399,127 @@ def _print_pod_logs(core_v1, job_name, namespace):
         logging.info("Pod %s logs:\n%s", pod.metadata.name, logs)
 
 
-def _check_pod_scheduling(core_v1, job_name, namespace):
+@functools.lru_cache(maxsize=16)
+def _check_node_pool_exists_cached(selector_items) -> bool:
+  """Use gcloud to verify that a GKE NodePool matches the pod node selector.
+
+  Note: This caches results for the process lifetime. If a user creates a new
+  node pool in another terminal (e.g. `keras-remote pool add`) during a long-running
+  session, this may return stale results. This is acceptable for our current
+  scale-to-zero model with ephemeral sessions.
+  """
+  selector = dict(selector_items)
+  try:
+    cmd = ["gcloud", "container", "node-pools", "list", "--format", "json"]
+
+    # Attempt to extract exact cluster context from kubeconfig
+    try:
+      _, active_context = config.kube_config.list_kube_config_contexts()
+      context_name = active_context.get("name", "")
+      if context_name.startswith("gke_"):
+        parts = context_name.split("_")
+        if len(parts) >= 4:
+          project = parts[1]
+          location = parts[2]
+          cluster = "_".join(parts[3:])
+          cmd.extend(
+            ["--cluster", cluster, "--location", location, "--project", project]
+          )
+    except Exception as e:
+      logging.warning(
+        "Could not determine cluster context from kubeconfig: %s", e
+      )
+
+    out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+    pools = json.loads(out)
+    for pool in pools:
+      config_dict = pool.get("config", {})
+      pool_labels = config_dict.get("labels", {}).copy()
+
+      # Map GKE injected node labels for accelerators mapping
+      accelerators = config_dict.get("accelerators", [])
+      if accelerators:
+        accel_type = accelerators[0].get("acceleratorType", "")
+        if accel_type.startswith("tpu-"):
+          pool_labels["cloud.google.com/gke-tpu-accelerator"] = accel_type
+        else:
+          pool_labels["cloud.google.com/gke-accelerator"] = accel_type
+
+      # TPU mapping fallback
+      machine_type = config_dict.get("machineType", "")
+      if machine_type.startswith("ct"):
+        # We roughly map TPU topology presence for preflight
+        pool_labels["cloud.google.com/gke-tpu-topology"] = selector.get(
+          "cloud.google.com/gke-tpu-topology", ""
+        )
+
+      if all(pool_labels.get(k) == str(v) for k, v in selector.items()):
+        return True
+    return False
+  except Exception as e:
+    # Degrade gracefully, but inform the user that the check failed.
+    logging.warning(
+      "Could not verify node pool existence via `gcloud`. "
+      "Proceeding with assumption that it exists. Error: %s",
+      e,
+    )
+    return True
+
+
+def _validate_node_pool_exists(selector: dict) -> bool:
+  if not selector:
+    return True
+  return _check_node_pool_exists_cached(tuple(sorted(selector.items())))
+
+
+def _check_pod_scheduling(core_v1, job_name, namespace, logged_pending):
   """Check for pod scheduling issues and raise helpful errors."""
   with suppress(ApiException):
     pods = core_v1.list_namespaced_pod(
       namespace, label_selector=f"job-name={job_name}"
     )
     for pod in pods.items:
+      pod_name = pod.metadata.name
       if pod.status.phase == "Pending":
         for condition in pod.status.conditions or []:
           if condition.type == "PodScheduled" and condition.status == "False":
             msg = condition.message or ""
-            if "Insufficient nvidia.com/gpu" in msg:
-              raise RuntimeError(
-                "No GPU nodes available. Ensure your GKE cluster has a "
-                "node pool with the required GPU type and available capacity."
-              )
-            elif (
+
+            is_insufficient = (
+              "Insufficient nvidia.com/gpu" in msg
+              or "Insufficient google.com/tpu" in msg
+            )
+            is_mismatch = (
               "didn't match Pod's node affinity/selector" in msg
               or "node selector" in msg.lower()
-            ):
-              selector = pod.spec.node_selector
-              selector_str = (
-                ", ".join([f"{k}: {v}" for k, v in selector.items()])
-                if selector
-                else "None"
-              )
-              raise RuntimeError(
-                f"No nodes match the accelerator selector: {selector_str}. "
-                "Check that your node pool has the correct accelerator type label. "
-                "See all supported accelerator symbols here: \n"
-                "https://github.com/keras-team/remote#supported-accelerators"
-              )
+            )
+
+            if is_insufficient or is_mismatch:
+              selector = pod.spec.node_selector or {}
+              if not _validate_node_pool_exists(selector):
+                selector_str = (
+                  ", ".join([f"{k}: {v}" for k, v in selector.items()])
+                  if selector
+                  else "None"
+                )
+                raise RuntimeError(
+                  f"No GKE node pool exists with selector '{selector_str}'. "
+                  "Please use 'keras-remote pool add' to configure this accelerator."
+                )
+
+              if pod_name not in logged_pending:
+                selector_str = (
+                  ", ".join([f"{k}: {v}" for k, v in selector.items()])
+                  if selector
+                  else "None"
+                )
+                logging.info(
+                  "Pod %s is Pending: %s.\n"
+                  "  Selector: %s\n"
+                  "  Waiting for GKE Cluster Autoscaler to provision a new node... (scale-to-zero)\n"
+                  "  Note: If this hangs indefinitely, ensure your GCP project has adequate quota.",
+                  pod_name,
+                  msg.split(". ")[0],
+                  selector_str,
+                )
+                logged_pending.add(pod_name)

@@ -5,6 +5,11 @@ from unittest import mock
 from absl.testing import absltest, parameterized
 
 from keras_remote.cli.config import NodePoolConfig
+from keras_remote.cli.constants import (
+  MAX_CLUSTER_CPU,
+  MAX_CLUSTER_MEMORY_GB,
+  NODE_MAX_RUN_DURATION_SECONDS,
+)
 from keras_remote.core.accelerators import GpuConfig, TpuConfig
 
 # Patch the pulumi_gcp module before importing program, so the module-level
@@ -73,11 +78,14 @@ class TestCreateTpuNodePool(parameterized.TestCase):
       cluster, tpu, "us-central2-b", "my-project", "tpu-v5p-abcd"
     )
 
-    call_kwargs = gcp_mock.container.NodePool.call_args
-    node_count = call_kwargs.kwargs.get(
-      "node_count", call_kwargs[1].get("node_count")
+    # Due to multi-host TPU workaround, initial_node_count is equal to num_nodes
+    call_kwargs = gcp_mock.container.NodePool.call_args.kwargs
+    self.assertEqual(call_kwargs.get("initial_node_count"), 4)
+    autoscaling_kwargs = (
+      gcp_mock.container.NodePoolAutoscalingArgs.call_args.kwargs
     )
-    self.assertEqual(node_count, 4)
+    self.assertEqual(autoscaling_kwargs.get("max_node_count"), 4)
+    self.assertEqual(autoscaling_kwargs.get("min_node_count"), 4)
 
   @mock.patch.object(program, "gcp")
   def test_pool_name_passed_through(self, gcp_mock):
@@ -276,6 +284,104 @@ class TestExportsDependOnResources(parameterized.TestCase):
         c.args[0]: c.args[1] for c in pulumi_mock.export.call_args_list
       }
       self.assertEqual(exported["accelerators"], [])
+
+
+class TestClusterAutoscalingAndNAP(absltest.TestCase):
+  """Verify cluster autoscaling and NAP are enabled correctly."""
+
+  def test_cluster_autoscaling_config(self):
+    """The cluster should have OPTIMIZE_UTILIZATION and NAP enabled."""
+    with (
+      mock.patch.object(program, "pulumi"),
+      mock.patch.object(program, "gcp") as gcp_mock,
+    ):
+      program.create_program(_make_config(None))()
+
+      gcp_mock.container.ClusterClusterAutoscalingArgs.assert_called_once()
+      call_args = (
+        gcp_mock.container.ClusterClusterAutoscalingArgs.call_args.kwargs
+      )
+      self.assertTrue(call_args.get("enabled"))
+      self.assertEqual(
+        call_args.get("autoscaling_profile"), "OPTIMIZE_UTILIZATION"
+      )
+
+      gcp_mock.container.ClusterClusterAutoscalingAutoProvisioningDefaultsArgs.assert_called_once()
+      gcp_mock.container.ClusterClusterAutoscalingAutoProvisioningDefaultsManagementArgs.assert_called_once_with(
+        auto_upgrade=True, auto_repair=True
+      )
+
+      gcp_mock.container.ClusterClusterAutoscalingResourceLimitArgs.assert_any_call(
+        resource_type="cpu", maximum=MAX_CLUSTER_CPU
+      )
+      gcp_mock.container.ClusterClusterAutoscalingResourceLimitArgs.assert_any_call(
+        resource_type="memory", maximum=MAX_CLUSTER_MEMORY_GB
+      )
+
+
+class TestScaleToZeroNodePools(parameterized.TestCase):
+  """Verify accelerator node pools can scale to zero and have maxRunDuration."""
+
+  @parameterized.named_parameters(
+    dict(
+      testcase_name="gpu",
+      accelerator=GpuConfig("l4", 1, "nvidia-l4", "g2-standard-4"),
+      expected_max_count=10,
+    ),
+    dict(
+      testcase_name="tpu_v5p",
+      accelerator=TpuConfig(
+        "v5p", 16, "2x2x4", "tpu-v5p-slice", "ct5p-hightpu-4t", 4
+      ),
+      expected_max_count=4,  # 16 chips / 4 per VM
+    ),
+  )
+  @mock.patch.object(program, "gcp")
+  def test_node_pool_scale_to_zero(
+    self, gcp_mock, accelerator, expected_max_count
+  ):
+    cluster = mock.MagicMock()
+    cluster.name = "test-cluster"
+
+    if isinstance(accelerator, GpuConfig):
+      program._create_gpu_node_pool(
+        cluster, accelerator, "us-central2-b", "my-project", "test-pool"
+      )
+    else:
+      program._create_tpu_node_pool(
+        cluster, accelerator, "us-central2-b", "my-project", "test-pool"
+      )
+
+    is_multi_host = getattr(accelerator, "num_nodes", 1) > 1
+
+    call_kwargs = gcp_mock.container.NodePool.call_args.kwargs
+    self.assertEqual(
+      call_kwargs.get("initial_node_count"),
+      expected_max_count if is_multi_host else 0,
+    )
+
+    autoscaling_kwargs = (
+      gcp_mock.container.NodePoolAutoscalingArgs.call_args.kwargs
+    )
+    self.assertEqual(
+      autoscaling_kwargs.get("min_node_count"),
+      expected_max_count if is_multi_host else 0,
+    )
+    self.assertEqual(
+      autoscaling_kwargs.get("max_node_count"), expected_max_count
+    )
+
+    mgmt_kwargs = gcp_mock.container.NodePoolManagementArgs.call_args.kwargs
+    self.assertTrue(mgmt_kwargs.get("auto_repair"))
+    self.assertTrue(mgmt_kwargs.get("auto_upgrade"))
+
+    node_config_kwargs = (
+      gcp_mock.container.NodePoolNodeConfigArgs.call_args.kwargs
+    )
+    self.assertEqual(
+      node_config_kwargs.get("max_run_duration"),
+      f"{NODE_MAX_RUN_DURATION_SECONDS}s",
+    )
 
 
 if __name__ == "__main__":
