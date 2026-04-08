@@ -12,9 +12,11 @@ import cloudpickle
 from absl.testing import absltest
 
 from kinetic.backend.execution import (
+  _FUSE_DATA_MOUNT_PREFIX,
   JobContext,
   _find_requirements,
   _prepare_artifacts,
+  _process_volumes,
   _requirements_uri,
   _upload_artifacts,
   submit_remote,
@@ -231,6 +233,106 @@ class TestFindRequirements(absltest.TestCase):
       _find_requirements(str(child)),
       str(child / "requirements.txt"),
     )
+
+
+class TestPrepareArtifactsFuse(absltest.TestCase):
+  """Tests for FUSE volume handling in _prepare_artifacts."""
+
+  def _make_func(self):
+    def my_train():
+      return 42
+
+    return my_train
+
+  def _make_ctx(self, volumes=None, args=(), kwargs=None):
+    return JobContext(
+      func=self._make_func(),
+      args=args,
+      kwargs=kwargs or {},
+      env_vars={},
+      accelerator="cpu",
+      container_image=None,
+      zone="us-central1-a",
+      project="proj",
+      cluster_name="kinetic-cluster",
+      volumes=volumes,
+    )
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  @mock.patch("kinetic.backend.execution.packager.zip_working_dir")
+  def test_fuse_volume_creates_fuse_spec(self, _zip, mock_upload):
+    mock_upload.return_value = "gs://bucket/hash/"
+    tmp = _make_temp_path(self)
+    data_dir = tmp / "dataset"
+    data_dir.mkdir()
+    (data_dir / "train.csv").write_text("data")
+
+    ctx = self._make_ctx(volumes={"/data": Data(str(data_dir), fuse=True)})
+    _prepare_artifacts(ctx, str(tmp))
+
+    self.assertIsNotNone(ctx.fuse_volume_specs)
+    self.assertLen(ctx.fuse_volume_specs, 1)
+    spec = ctx.fuse_volume_specs[0]
+    self.assertEqual(spec["gcs_uri"], "gs://bucket/hash/")
+    self.assertEqual(spec["mount_path"], "/data")
+    self.assertTrue(spec["is_dir"])
+    self.assertTrue(spec["read_only"])
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  @mock.patch("kinetic.backend.execution.packager.zip_working_dir")
+  def test_non_fuse_volume_no_fuse_specs(self, _zip, mock_upload):
+    mock_upload.return_value = "gs://bucket/hash/"
+    tmp = _make_temp_path(self)
+    data_dir = tmp / "dataset"
+    data_dir.mkdir()
+    (data_dir / "train.csv").write_text("data")
+
+    ctx = self._make_ctx(volumes={"/data": Data(str(data_dir))})
+    _prepare_artifacts(ctx, str(tmp))
+
+    self.assertIsNone(ctx.fuse_volume_specs)
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  @mock.patch("kinetic.backend.execution.packager.zip_working_dir")
+  def test_fuse_data_arg_creates_auto_mount(self, _zip, mock_upload):
+    mock_upload.return_value = "gs://bucket/hash/"
+    tmp = _make_temp_path(self)
+
+    fuse_data = Data("gs://bucket/dataset/", fuse=True)
+    ctx = self._make_ctx(args=(fuse_data,))
+    _prepare_artifacts(ctx, str(tmp))
+
+    self.assertIsNotNone(ctx.fuse_volume_specs)
+    self.assertLen(ctx.fuse_volume_specs, 1)
+    spec = ctx.fuse_volume_specs[0]
+    self.assertEqual(spec["mount_path"], "/_kinetic/fuse-data/0")
+    self.assertTrue(spec["is_dir"])
+    self.assertTrue(spec["read_only"])
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  @mock.patch("kinetic.backend.execution.packager.zip_working_dir")
+  def test_mixed_fuse_and_non_fuse_volumes(self, _zip, mock_upload):
+    mock_upload.return_value = "gs://bucket/hash/"
+    tmp = _make_temp_path(self)
+    data_dir = tmp / "dataset"
+    data_dir.mkdir()
+    (data_dir / "train.csv").write_text("data")
+    config_dir = tmp / "config"
+    config_dir.mkdir()
+    (config_dir / "cfg.json").write_text("{}")
+
+    ctx = self._make_ctx(
+      volumes={
+        "/data": Data(str(data_dir), fuse=True),
+        "/config": Data(str(config_dir)),
+      }
+    )
+    _prepare_artifacts(ctx, str(tmp))
+
+    # Only the fuse volume should be in fuse_volume_specs
+    self.assertIsNotNone(ctx.fuse_volume_specs)
+    self.assertLen(ctx.fuse_volume_specs, 1)
+    self.assertEqual(ctx.fuse_volume_specs[0]["mount_path"], "/data")
 
 
 class TestPrepareArtifacts(absltest.TestCase):
@@ -591,6 +693,59 @@ class TestSubmitRemote(absltest.TestCase):
     mock_cleanup.assert_called_once_with(
       ctx.bucket_name, ctx.job_id, project=ctx.project
     )
+
+
+class TestProcessVolumesReservedPath(absltest.TestCase):
+  """Tests that _process_volumes rejects mount paths under the reserved prefix."""
+
+  def _make_ctx(self, volumes):
+    ctx = MagicMock()
+    ctx.volumes = volumes
+    ctx.bucket_name = "test-bucket"
+    ctx.project = "test-project"
+    return ctx
+
+  def _make_data_stub(self, *, is_gcs=True, is_dir=False, fuse=False):
+    obj = MagicMock()
+    obj.is_gcs = is_gcs
+    obj.is_dir = is_dir
+    obj.fuse = fuse
+    obj.path = "gs://b/p"
+    return obj
+
+  def test_rejects_direct_child_of_reserved_prefix(self):
+    mount_path = f"{_FUSE_DATA_MOUNT_PREFIX}/0"
+    ctx = self._make_ctx({mount_path: self._make_data_stub()})
+
+    with self.assertRaises(ValueError) as cm:
+      _process_volumes(ctx, "/tmp/caller", set())
+    self.assertIn(mount_path, str(cm.exception))
+
+  def test_rejects_nested_path_under_reserved_prefix(self):
+    mount_path = f"{_FUSE_DATA_MOUNT_PREFIX}/42/sub"
+    ctx = self._make_ctx({mount_path: self._make_data_stub()})
+
+    with self.assertRaises(ValueError) as cm:
+      _process_volumes(ctx, "/tmp/caller", set())
+    self.assertIn(mount_path, str(cm.exception))
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  def test_allows_non_reserved_path(self, mock_upload):
+    mock_upload.return_value = "gs://test-bucket/data/hash"
+    ctx = self._make_ctx({"/mnt/my-data": self._make_data_stub()})
+
+    volume_refs, _ = _process_volumes(ctx, "/tmp/caller", set())
+    self.assertLen(volume_refs, 1)
+
+  @mock.patch("kinetic.backend.execution.storage.upload_data")
+  def test_allows_similar_but_distinct_prefix(self, mock_upload):
+    mock_upload.return_value = "gs://test-bucket/data/hash"
+    ctx = self._make_ctx(
+      {f"{_FUSE_DATA_MOUNT_PREFIX}-extra": self._make_data_stub()}
+    )
+
+    volume_refs, _ = _process_volumes(ctx, "/tmp/caller", set())
+    self.assertLen(volume_refs, 1)
 
 
 if __name__ == "__main__":

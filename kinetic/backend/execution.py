@@ -25,7 +25,7 @@ from kinetic.constants import (
   zone_to_region,
 )
 from kinetic.credentials import ensure_credentials
-from kinetic.data import _make_data_ref
+from kinetic.data import make_data_ref
 from kinetic.infra import container_builder
 from kinetic.jobs import JobHandle
 from kinetic.utils import packager, storage
@@ -60,6 +60,9 @@ class JobContext:
 
   # Data volumes {mount_path: Data}
   volumes: Optional[dict] = None
+
+  # FUSE volume specs for pod spec generation (not serialized into payload)
+  fuse_volume_specs: Optional[list[dict]] = None
 
   # Configuration modifiers
   spot: bool = False
@@ -190,6 +193,7 @@ class GKEBackend(BaseK8sBackend):
       namespace=self.namespace,
       spot=ctx.spot,
       requirements_uri=requirements_uri,
+      fuse_volume_specs=ctx.fuse_volume_specs,
     )
 
   def wait_for_job(self, job: Any, ctx: JobContext) -> None:
@@ -244,6 +248,7 @@ class PathwaysBackend(BaseK8sBackend):
       namespace=self.namespace,
       spot=ctx.spot,
       requirements_uri=requirements_uri,
+      fuse_volume_specs=ctx.fuse_volume_specs,
     )
 
   def wait_for_job(self, job: Any, ctx: JobContext) -> None:
@@ -278,8 +283,8 @@ class PathwaysBackend(BaseK8sBackend):
 def _find_requirements(start_dir: str) -> Optional[str]:
   """Search up directory tree for requirements.txt or pyproject.toml.
 
-  At each directory level, ``requirements.txt`` is preferred over
-  ``pyproject.toml``.  The first match found while walking towards the
+  At each directory level, `requirements.txt` is preferred over
+  `pyproject.toml`.  The first match found while walking towards the
   filesystem root is returned.
   """
   search_dir = start_dir
@@ -313,33 +318,134 @@ def _resolve_working_dir(func: Callable) -> str:
   return os.getcwd()
 
 
+_FUSE_DATA_MOUNT_PREFIX = "/_kinetic/fuse-data"
+
+
+def _fuse_gcs_uri(gcs_uri: str, data_obj) -> str:
+  """Return a file-level GCS URI for FUSE single-file mounts.
+
+  For uploaded local single files, upload_data returns a directory-level
+  URI (the hash prefix).  Append the filename so build_gcs_fuse_volumes
+  scopes only-dir to the hash directory, not the entire data-cache/ tree.
+  GCS-native URIs and directories are returned unchanged.
+  """
+  if not data_obj.is_dir and not data_obj.is_gcs:
+    return f"{gcs_uri}/{os.path.basename(data_obj.path)}"
+  return gcs_uri
+
+
+def _process_volumes(
+  ctx: JobContext, caller_path: str, exclude_paths: set[str]
+) -> tuple[list[dict], list[dict]]:
+  """Upload volume Data objects and build refs + FUSE specs.
+
+  Args:
+      ctx: Job context containing volume definitions, bucket name, and project.
+      caller_path: Absolute path of the caller's working directory, used to
+          resolve relative Data object paths for exclusion.
+      exclude_paths: Mutable set of local paths to exclude from the working
+          directory archive. Paths of non-GCS Data objects are added here so
+          they are not redundantly packaged.
+
+  Returns:
+      Tuple of (volume_refs, fuse_specs) where *volume_refs* are serializable
+      data-ref dicts to embed in the payload, and *fuse_specs* are GCS FUSE
+      mount descriptors for volumes that requested lazy loading.
+  """
+  volume_refs: list[dict] = []
+  fuse_specs: list[dict] = []
+  if not ctx.volumes:
+    return volume_refs, fuse_specs
+
+  for mount_path, data_obj in ctx.volumes.items():
+    if mount_path.startswith(_FUSE_DATA_MOUNT_PREFIX + "/"):
+      raise ValueError(
+        f"Volume mount path {mount_path!r} is reserved for "
+        f"auto-generated FUSE mounts. Use a different path."
+      )
+    gcs_uri = storage.upload_data(ctx.bucket_name, data_obj, ctx.project)
+    volume_refs.append(
+      make_data_ref(
+        gcs_uri, data_obj.is_dir, mount_path=mount_path, fuse=data_obj.fuse
+      )
+    )
+    if data_obj.fuse:
+      fuse_specs.append(
+        {
+          "gcs_uri": _fuse_gcs_uri(gcs_uri, data_obj),
+          "mount_path": mount_path,
+          "is_dir": data_obj.is_dir,
+          "read_only": True,
+        }
+      )
+    if not data_obj.is_gcs:
+      _maybe_exclude(data_obj.path, caller_path, exclude_paths)
+
+  return volume_refs, fuse_specs
+
+
+def _process_data_args(
+  ctx: JobContext, caller_path: str, exclude_paths: set[str]
+) -> tuple[dict[int, dict], list[dict]]:
+  """Upload Data objects found in function args and build ref map + FUSE specs.
+
+  Args:
+      ctx: Job context containing the function args/kwargs, bucket name, and
+          project.
+      caller_path: Absolute path of the caller's working directory, used to
+          resolve relative Data object paths for exclusion.
+      exclude_paths: Mutable set of local paths to exclude from the working
+          directory archive. Paths of non-GCS Data objects are added here so
+          they are not redundantly packaged.
+
+  Returns:
+      Tuple of (ref_map, fuse_specs) where *ref_map* is a dict keyed by
+      ``id(data_obj)`` mapping to serializable data-ref dicts, and
+      *fuse_specs* are GCS FUSE mount descriptors for args that requested
+      lazy loading.
+  """
+  ref_map = {}
+  fuse_specs = []
+  fuse_counter = 0
+
+  for data_obj, _ in packager.extract_data_refs(ctx.args, ctx.kwargs):
+    gcs_uri = storage.upload_data(ctx.bucket_name, data_obj, ctx.project)
+    if data_obj.fuse:
+      mount_path = f"{_FUSE_DATA_MOUNT_PREFIX}/{fuse_counter}"
+      fuse_counter += 1
+      fuse_specs.append(
+        {
+          "gcs_uri": _fuse_gcs_uri(gcs_uri, data_obj),
+          "mount_path": mount_path,
+          "is_dir": data_obj.is_dir,
+          "read_only": True,
+        }
+      )
+      ref_map[id(data_obj)] = make_data_ref(
+        gcs_uri, data_obj.is_dir, mount_path=mount_path, fuse=True
+      )
+    else:
+      ref_map[id(data_obj)] = make_data_ref(gcs_uri, data_obj.is_dir)
+    if not data_obj.is_gcs:
+      _maybe_exclude(data_obj.path, caller_path, exclude_paths)
+
+  return ref_map, fuse_specs
+
+
 def _prepare_artifacts(ctx: JobContext, tmpdir: str) -> None:
   """Package function payload and working directory context."""
   logging.info("Packaging function and context...")
+  if ctx.working_dir is None:
+    raise ValueError("working_dir must be set before prepare")
   caller_path = ctx.working_dir
-
-  # Process Data objects
   exclude_paths: set[str] = set()
-  ref_map = {}  # id(Data) -> ref dict (for arg replacement)
-  volume_refs = []  # list of ref dicts (for volumes)
 
-  # Process volumes
-  if ctx.volumes:
-    for mount_path, data_obj in ctx.volumes.items():
-      gcs_uri = storage.upload_data(ctx.bucket_name, data_obj, ctx.project)
-      volume_refs.append(
-        _make_data_ref(gcs_uri, data_obj.is_dir, mount_path=mount_path)
-      )
-      if not data_obj.is_gcs:
-        _maybe_exclude(data_obj.path, caller_path, exclude_paths)
+  # Upload Data objects and build serializable refs
+  volume_refs, vol_fuse = _process_volumes(ctx, caller_path, exclude_paths)
+  ref_map, arg_fuse = _process_data_args(ctx, caller_path, exclude_paths)
 
-  # Process Data in function args
-  data_refs = packager.extract_data_refs(ctx.args, ctx.kwargs)
-  for data_obj, _position in data_refs:
-    gcs_uri = storage.upload_data(ctx.bucket_name, data_obj, ctx.project)
-    ref_map[id(data_obj)] = _make_data_ref(gcs_uri, data_obj.is_dir)
-    if not data_obj.is_gcs:
-      _maybe_exclude(data_obj.path, caller_path, exclude_paths)
+  all_fuse = vol_fuse + arg_fuse
+  ctx.fuse_volume_specs = all_fuse if all_fuse else None
 
   # Replace Data with refs in args/kwargs
   if ref_map:
@@ -473,7 +579,7 @@ def submit_remote(ctx: JobContext, backend: BaseK8sBackend) -> JobHandle:
   via the returned handle.
 
   Returns:
-      A ``JobHandle`` representing the submitted job.
+      A `JobHandle` representing the submitted job.
   """
 
   prepare_execution(ctx, backend)
