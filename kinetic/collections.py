@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from absl import logging
+from google.api_core import exceptions as google_exceptions
 
 from kinetic.collections_helpers import (
   append_child_to_manifest,
@@ -32,6 +33,7 @@ from kinetic.utils import storage
 
 _DEFAULT_MAX_CONCURRENT = 64
 _STATUS_POLL_INTERVAL = 5.0
+_MANIFEST_POLL_INTERVAL = 10.0
 
 
 def _resolve_bucket(
@@ -101,9 +103,11 @@ class BatchHandle:
     default_factory=dict, repr=False, compare=False
   )
 
-  # ------------------------------------------------------------------
-  # Observation
-  # ------------------------------------------------------------------
+  # Cached failure list populated by results() so that failures()
+  # remains accurate after cleanup deletes K8s resources.
+  _cached_failures: list[JobHandle] | None = field(
+    default=None, repr=False, compare=False
+  )
 
   def statuses(self) -> list[tuple[int, JobStatus]]:
     """Return `(index, status)` for each submitted job."""
@@ -125,10 +129,6 @@ class BatchHandle:
     return len(seen) >= total_submitted and (
       len(seen) + total_errors >= len(self.jobs)
     )
-
-  # ------------------------------------------------------------------
-  # Blocking helpers
-  # ------------------------------------------------------------------
 
   def wait(self, *, timeout: float | None = None) -> None:
     """Block until all jobs reach a terminal state."""
@@ -155,12 +155,20 @@ class BatchHandle:
         for job in self.jobs
         if job is not None
       ):
-        return
+        break
       if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError(
           f"Timed out waiting for batch {self.group_id} after {timeout}s"
         )
       time.sleep(_STATUS_POLL_INTERVAL)
+
+    if self._submission_errors:
+      logging.warning(
+        "Batch %s: %d input(s) failed at submission time. "
+        "Use handle.submission_failures to inspect.",
+        self.group_id,
+        len(self._submission_errors),
+      )
 
   def as_completed(
     self,
@@ -271,17 +279,17 @@ class BatchHandle:
           exc = self._submission_errors[i]
           if return_exceptions:
             results_list[i] = exc
-          else:
-            failures.append(None)  # type: ignore[arg-type]
+          failures.append(None)  # type: ignore[arg-type]
         continue
       try:
         results_list[i] = job.result(cleanup=cleanup)
       except Exception as exc:
         if return_exceptions:
           results_list[i] = exc
-        else:
-          failures.append(job)
+        failures.append(job)
 
+    with self._lock:
+      self._cached_failures = [f for f in failures if f is not None]
     return results_list, failures
 
   def _results_completion_order(
@@ -301,16 +309,16 @@ class BatchHandle:
       except Exception as exc:
         if return_exceptions:
           results_list.append(exc)
-        else:
-          failures.append(job)
+        failures.append(job)
 
     for idx in sorted(self._submission_errors):
       exc = self._submission_errors[idx]
       if return_exceptions:
         results_list.append(exc)
-      else:
-        failures.append(None)  # type: ignore[arg-type]
+      failures.append(None)  # type: ignore[arg-type]
 
+    with self._lock:
+      self._cached_failures = [f for f in failures if f is not None]
     return results_list, failures
 
   def failures(self) -> list[JobHandle]:
@@ -320,16 +328,35 @@ class BatchHandle:
     `NOT_FOUND` (e.g. after cleanup) are excluded because the
     status is ambiguous — use `statuses()` for finer control.
 
-    Note:
-      If `results(cleanup=True)` was called (the default), child
-      resources are deleted and their status becomes `NOT_FOUND`.
-      In that case, this method will return an empty list.
+    After `results()` has been called, this returns the cached
+    failure list from that collection pass, so it remains accurate
+    even if cleanup has deleted K8s resources.
+
+    See Also:
+      `submission_failures`: returns per-input errors for inputs
+      that failed at submission time (`jobs[idx]` is `None`).
     """
+    with self._lock:
+      if self._cached_failures is not None:
+        return list(self._cached_failures)
     return [
       job
       for job in self.jobs
       if job is not None and job.status() == JobStatus.FAILED
     ]
+
+  @property
+  def submission_failures(self) -> dict[int, Exception]:
+    """Return a copy of per-input submission errors (index -> exception).
+
+    These are inputs where the submission itself failed (e.g. validation
+    error, network error).  The corresponding `jobs[idx]` slot is
+    `None`.  These errors are included in `results()` output but are
+    **not** reflected by `failures()` which only inspects live job
+    statuses.
+    """
+    with self._lock:
+      return dict(self._submission_errors)
 
   def cancel(self) -> None:
     """Cancel all non-terminal jobs in the collection."""
@@ -339,7 +366,7 @@ class BatchHandle:
       try:
         if job.status() not in _TERMINAL_STATUSES:
           job.cancel()
-      except Exception:
+      except RuntimeError:
         logging.warning("Failed to cancel job %s", job.job_id)
 
   def cleanup(self, *, k8s: bool = True, gcs: bool = True) -> None:
@@ -355,7 +382,7 @@ class BatchHandle:
         continue
       try:
         job.cleanup(k8s=k8s, gcs=gcs)
-      except Exception:
+      except (RuntimeError, google_exceptions.GoogleAPIError):
         logging.warning("Failed to clean up job %s", job.job_id)
 
     if gcs:
@@ -369,15 +396,101 @@ class BatchHandle:
       if bucket:
         try:
           storage.cleanup_manifest(bucket, self.group_id, project=project)
-        except Exception:
+        except google_exceptions.GoogleAPIError:
           logging.warning(
             "Failed to clean up manifest for group %s", self.group_id
           )
 
 
-# ------------------------------------------------------------------
-# Submission loop
-# ------------------------------------------------------------------
+def _load_child_handle(
+  bucket_name: str,
+  child: dict,
+  total_expected: int,
+  project: str,
+) -> tuple[int, JobHandle] | None:
+  """Download and reconstruct a single child handle.
+
+  Returns `(group_index, handle)` on success, or `None` if the
+  child has an invalid index or the download fails.
+  """
+  idx = child["group_index"]
+  if not isinstance(idx, int) or idx < 0 or idx >= total_expected:
+    logging.warning(
+      "Invalid child index %r (total_expected=%d); skipping",
+      idx,
+      total_expected,
+    )
+    return None
+  try:
+    payload = storage.download_handle(
+      bucket_name, child["job_id"], project=project
+    )
+    return idx, JobHandle.from_dict(payload)
+  except (google_exceptions.GoogleAPIError, KeyError, ValueError):
+    logging.warning(
+      "Could not load handle for child job %s (index %d); skipping",
+      child["job_id"],
+      idx,
+    )
+    return None
+
+
+def _manifest_poll_loop(
+  handle: BatchHandle,
+  bucket_name: str,
+  group_id: str,
+  project: str,
+  total_expected: int,
+  poll_interval: float,
+  timeout: float | None,
+) -> None:
+  """Poll GCS manifest until all children appear, then set `_submission_complete`.
+
+  Used by `attach_batch()` when the manifest shows fewer children
+  than `total_expected`, indicating the original `map()` is still
+  submitting.
+  """
+  deadline = None if timeout is None else time.monotonic() + timeout
+
+  try:
+    while True:
+      if deadline is not None and time.monotonic() >= deadline:
+        logging.warning(
+          "Timed out polling manifest for batch %s (%d/%d children)",
+          group_id,
+          sum(1 for j in handle.jobs if j is not None),
+          total_expected,
+        )
+        break
+
+      time.sleep(poll_interval)
+
+      try:
+        manifest = storage.download_manifest(
+          bucket_name, group_id, project=project
+        )
+      except google_exceptions.GoogleAPIError:
+        logging.warning("Failed to poll manifest for batch %s", group_id)
+        continue
+
+      for child in manifest.get("children", []):
+        idx = child.get("group_index")
+        if not isinstance(idx, int) or idx < 0 or idx >= total_expected:
+          continue
+        with handle._lock:
+          if handle.jobs[idx] is not None:
+            continue
+        result = _load_child_handle(bucket_name, child, total_expected, project)
+        if result is not None:
+          loaded_idx, job_handle = result
+          with handle._lock:
+            handle.jobs[loaded_idx] = job_handle
+
+      loaded = sum(1 for j in handle.jobs if j is not None)
+      if loaded >= total_expected:
+        break
+  finally:
+    handle._submission_complete.set()
 
 
 def _cancel_active(handle: BatchHandle, active_indices: set[int]) -> None:
@@ -388,8 +501,166 @@ def _cancel_active(handle: BatchHandle, active_indices: set[int]) -> None:
       continue
     try:
       job.cancel()
-    except Exception:
+    except RuntimeError:
       logging.warning("Failed to cancel job at index %d", idx)
+
+
+@dataclass
+class _SubmissionState:
+  """Groups the mutable state tracked by the submission loop.
+
+  Provides named predicates so the main loop reads as a clear
+  sequence of phases rather than a tangle of flags and counters.
+  """
+
+  handle: BatchHandle
+  manifest: dict
+  submit_fn: Any
+  inputs: list
+  input_mode: str
+  max_concurrent: int | None
+  max_attempts: int
+  fail_fast: bool
+  cancel_running_on_fail: bool
+
+  attempt_counts: list[int] = field(init=False)
+  pending: collections.deque = field(init=False)
+  active: set[int] = field(default_factory=set, init=False)
+  stop_launching: bool = field(default=False, init=False)
+
+  def __post_init__(self):
+    self.attempt_counts = [0] * len(self.inputs)
+    self.pending = collections.deque(range(len(self.inputs)))
+
+  @property
+  def has_work(self) -> bool:
+    """True while jobs remain to be submitted or are still running."""
+    return bool(self.pending) or bool(self.active)
+
+  def can_submit_more(self) -> bool:
+    """True when the next pending job is allowed to launch."""
+    if not self.pending or self.stop_launching:
+      return False
+    return self.max_concurrent is None or len(self.active) < self.max_concurrent
+
+  def needs_active_polling(self) -> bool:
+    """True when the loop must poll active jobs itself.
+
+    When all jobs are submitted with no retries and `fail_fast`
+    is off, the caller uses `wait()`/`results()` to observe
+    terminal states, so the submission loop can exit early.
+    """
+    if not self.active:
+      return False
+    return bool(self.pending) or self.max_attempts > 1 or self.fail_fast
+
+  def trigger_fail_fast(self) -> None:
+    """Stop launching new jobs and optionally cancel siblings."""
+    self.stop_launching = True
+    if self.cancel_running_on_fail:
+      _cancel_active(self.handle, self.active)
+
+
+def _submit_available(state: _SubmissionState) -> None:
+  """Submit pending jobs up to the concurrency limit.
+
+  On per-input errors the exception is recorded in
+  `handle._submission_errors` and, when `fail_fast` is set,
+  `trigger_fail_fast` is called.
+  """
+  handle = state.handle
+
+  while state.can_submit_more():
+    idx = state.pending.popleft()
+    state.attempt_counts[idx] += 1
+
+    # attempt submission
+    try:
+      job_handle = call_with_input(
+        state.submit_fn, state.inputs[idx], state.input_mode
+      )
+    except Exception as exc:
+      logging.error("Submission failed for index %d: %s", idx, exc)
+      with handle._lock:
+        handle._submission_errors[idx] = exc
+      if state.fail_fast:
+        state.trigger_fail_fast()
+      continue
+
+    # tag with group metadata and persist
+    job_handle.group_id = handle.group_id
+    job_handle.group_kind = state.manifest["group_kind"]
+    job_handle.group_index = idx
+
+    try:
+      storage.upload_handle(
+        job_handle.bucket_name,
+        job_handle.job_id,
+        job_handle.to_dict(),
+        project=job_handle.project,
+      )
+    except google_exceptions.GoogleAPIError:
+      logging.warning(
+        "Failed to re-upload handle with group fields for %s",
+        job_handle.job_id,
+      )
+
+    # register in handle and manifest
+    with handle._lock:
+      handle.jobs[idx] = job_handle
+    state.active.add(idx)
+
+    append_child_to_manifest(
+      state.manifest, idx, job_handle.job_id, state.attempt_counts[idx]
+    )
+    try:
+      storage.upload_manifest(
+        handle._bucket_name,
+        handle.group_id,
+        state.manifest,
+        project=handle._project,
+      )
+    except google_exceptions.GoogleAPIError:
+      logging.warning(
+        "Failed to update manifest after submitting index %d", idx
+      )
+
+  if state.stop_launching:
+    state.pending.clear()
+
+
+def _poll_and_handle_terminal(state: _SubmissionState) -> None:
+  """Poll active jobs for terminal states; retry or trigger fail_fast."""
+  handle = state.handle
+
+  # Collect all newly-terminal jobs in one pass.
+  newly_terminal: list[tuple[int, JobStatus, JobHandle]] = []
+  for idx in list(state.active):
+    job = handle.jobs[idx]
+    if job is None:
+      continue
+    try:
+      status = job.status()
+      if status in _TERMINAL_STATUSES:
+        newly_terminal.append((idx, status, job))
+    except (RuntimeError, google_exceptions.GoogleAPIError):
+      logging.warning("Failed to poll status for index %d", idx)
+
+  for idx, status, job in newly_terminal:
+    state.active.discard(idx)
+
+    if status not in (JobStatus.FAILED, JobStatus.NOT_FOUND):
+      continue
+
+    if state.attempt_counts[idx] < state.max_attempts:
+      # Retry: clean up previous attempt's K8s resources and re-queue.
+      try:
+        job.cleanup(k8s=True, gcs=False)
+      except RuntimeError:
+        logging.warning("Failed to clean up before retry for index %d", idx)
+      state.pending.append(idx)
+    elif state.fail_fast:
+      state.trigger_fail_fast()
 
 
 def _submission_loop(
@@ -406,127 +677,38 @@ def _submission_loop(
   """Core submission and retry loop.
 
   Mutates *handle.jobs* and *manifest* in place.  Runs in the calling
-  thread (`max_concurrent=None` and `retries=0`) or in a daemon
+  thread (`max_concurrent=None` and `retries=0`) or in a background
   thread otherwise.
-  """
-  group_id = handle.group_id
-  group_kind = manifest["group_kind"]
-  bucket_name = handle._bucket_name
-  project = handle._project
 
-  attempt_counts = [0] * len(inputs)
-  pending_indices = collections.deque(range(len(inputs)))
-  active_indices: set[int] = set()
-  stop_launching = False
-  max_attempts = 1 + retries
+  Each iteration follows three phases:
+
+  1. **Submit** — launch pending jobs up to the concurrency limit.
+  2. **Poll**  — check active jobs for terminal states, retry or
+     trigger `fail_fast` as needed.
+  3. **Sleep** — back off before the next poll cycle.
+  """
+  state = _SubmissionState(
+    handle=handle,
+    manifest=manifest,
+    submit_fn=submit_fn,
+    inputs=inputs,
+    input_mode=input_mode,
+    max_concurrent=max_concurrent,
+    max_attempts=1 + retries,
+    fail_fast=fail_fast,
+    cancel_running_on_fail=cancel_running_on_fail,
+  )
 
   try:
-    while pending_indices or active_indices:
-      # Submit pending jobs up to concurrency limit
-      while pending_indices and not stop_launching:
-        if max_concurrent is not None and len(active_indices) >= max_concurrent:
-          break
+    while state.has_work:
+      _submit_available(state)
 
-        idx = pending_indices.popleft()
-        attempt_counts[idx] += 1
-
-        try:
-          job_handle = call_with_input(submit_fn, inputs[idx], input_mode)
-        except Exception as exc:
-          logging.error("Submission failed for index %d: %s", idx, exc)
-          with handle._lock:
-            handle._submission_errors[idx] = exc
-          if fail_fast:
-            stop_launching = True
-            if cancel_running_on_fail:
-              _cancel_active(handle, active_indices)
-          continue
-
-        # Inject group metadata and re-upload handle.
-        job_handle.group_id = group_id
-        job_handle.group_kind = group_kind
-        job_handle.group_index = idx
-
-        try:
-          storage.upload_handle(
-            job_handle.bucket_name,
-            job_handle.job_id,
-            job_handle.to_dict(),
-            project=job_handle.project,
-          )
-        except Exception:
-          logging.warning(
-            "Failed to re-upload handle with group fields for %s",
-            job_handle.job_id,
-          )
-
-        with handle._lock:
-          handle.jobs[idx] = job_handle
-
-        active_indices.add(idx)
-
-        append_child_to_manifest(
-          manifest, idx, job_handle.job_id, attempt_counts[idx]
-        )
-        try:
-          storage.upload_manifest(
-            bucket_name, group_id, manifest, project=project
-          )
-        except Exception:
-          logging.warning(
-            "Failed to update manifest after submitting index %d",
-            idx,
-          )
-
-      # If fail_fast stopped launching, discard remaining pending jobs.
-      if stop_launching:
-        pending_indices.clear()
-
-      # Nothing left to do
-      if not active_indices:
+      if not state.needs_active_polling():
         break
 
-      # All jobs submitted, no retries, and fail_fast is off — no need
-      # to poll.  The caller uses wait()/results() to observe terminal
-      # states.  When fail_fast is on we must keep polling so that
-      # runtime failures trigger sibling cancellation.
-      if not pending_indices and retries == 0 and not fail_fast:
-        break
+      _poll_and_handle_terminal(state)
 
-      # Poll active jobs for terminal states
-      newly_terminal: list[tuple[int, JobStatus]] = []
-      for idx in list(active_indices):
-        job = handle.jobs[idx]
-        if job is None:
-          continue
-        try:
-          status = job.status()
-          if status in _TERMINAL_STATUSES:
-            newly_terminal.append((idx, status))
-        except Exception:
-          logging.warning("Failed to poll status for index %d", idx)
-
-      for idx, status in newly_terminal:
-        active_indices.discard(idx)
-
-        if status in (JobStatus.FAILED, JobStatus.NOT_FOUND):
-          if attempt_counts[idx] < max_attempts:
-            # Clean up previous attempt's K8s resources.
-            try:
-              handle.jobs[idx].cleanup(k8s=True, gcs=False)  # type: ignore[union-attr]
-            except Exception:
-              logging.warning(
-                "Failed to clean up before retry for index %d",
-                idx,
-              )
-            pending_indices.append(idx)
-          else:
-            if fail_fast:
-              stop_launching = True
-              if cancel_running_on_fail:
-                _cancel_active(handle, active_indices)
-
-      if active_indices or pending_indices:
+      if state.has_work:
         time.sleep(_STATUS_POLL_INTERVAL)
 
   except BaseException as exc:
@@ -668,25 +850,31 @@ def map(
   return handle
 
 
-# ------------------------------------------------------------------
-# Public API — attach_batch
-# ------------------------------------------------------------------
-
-
 def attach_batch(
   group_id: str,
   project: str | None = None,
   cluster: str | None = None,
+  poll_interval: float = _MANIFEST_POLL_INTERVAL,
+  poll_timeout: float | None = None,
 ) -> BatchHandle:
   """Reattach to an existing batch collection by *group_id*.
 
   Downloads the group manifest from GCS, reconstructs `JobHandle`
   objects for each child, and returns a fully usable `BatchHandle`.
 
+  If the manifest has fewer children than `total_expected` (i.e.
+  the original `map()` is still submitting), the returned handle
+  polls the manifest in a background thread until all children
+  appear or *poll_timeout* is reached.
+
   Args:
     group_id: The collection identifier (e.g. `"grp-a1b2c3d4"`).
     project: GCP project (uses default when *None*).
     cluster: GKE cluster name (uses default when *None*).
+    poll_interval: Seconds between manifest polls when the batch
+      is partially submitted.
+    poll_timeout: Maximum seconds to poll for remaining children.
+      `None` means poll indefinitely.
 
   Returns:
     A hydrated `BatchHandle` ready for `results()`, etc.
@@ -706,33 +894,12 @@ def attach_batch(
   jobs: list[JobHandle | None] = [None] * total_expected
 
   for child in children:
-    idx = child["group_index"]
-    if not isinstance(idx, int) or idx < 0 or idx >= total_expected:
-      logging.warning(
-        "Invalid child index %r (total_expected=%d); skipping",
-        idx,
-        total_expected,
-      )
-      continue
-    try:
-      payload = storage.download_handle(
-        bucket_name, child["job_id"], project=resolved_project
-      )
-      jobs[idx] = JobHandle.from_dict(payload)
-    except Exception:
-      logging.warning(
-        "Could not load handle for child job %s (index %d); skipping",
-        child["job_id"],
-        idx,
-      )
-
-  if len(children) < total_expected:
-    logging.warning(
-      "Batch %s was partially submitted: %d of %d expected jobs",
-      group_id,
-      len(children),
-      total_expected,
+    result = _load_child_handle(
+      bucket_name, child, total_expected, resolved_project
     )
+    if result is not None:
+      idx, job_handle = result
+      jobs[idx] = job_handle
 
   handle = BatchHandle(
     group_id=manifest["group_id"],
@@ -742,8 +909,32 @@ def attach_batch(
     _bucket_name=bucket_name,
     _project=resolved_project,
   )
-  # Submission is already complete for reattached handles — the
-  # reattached handle has no submission thread.
-  handle._submission_complete.set()
+
+  loaded = sum(1 for j in jobs if j is not None)
+  if loaded >= total_expected:
+    # All children present — mark complete immediately.
+    handle._submission_complete.set()
+  else:
+    logging.warning(
+      "Batch %s was partially submitted: %d of %d expected jobs. "
+      "Polling manifest for remaining children.",
+      group_id,
+      loaded,
+      total_expected,
+    )
+    thread = threading.Thread(
+      target=_manifest_poll_loop,
+      kwargs={
+        "handle": handle,
+        "bucket_name": bucket_name,
+        "group_id": group_id,
+        "project": resolved_project,
+        "total_expected": total_expected,
+        "poll_interval": poll_interval,
+        "timeout": poll_timeout,
+      },
+      daemon=True,
+    )
+    thread.start()
 
   return handle
