@@ -111,21 +111,33 @@ SLIME_BASE_REPO = "us-docker.pkg.dev/your-project-id/kinetic-slime"
 
 
 def _upload_directory_to_gcs(local_dir: str, gcs_dir: str) -> None:
+    from pathlib import Path
     from google.cloud import storage
+    from google.cloud.storage import transfer_manager
 
     if not gcs_dir.startswith("gs://"):
         raise ValueError(f"Expected a gs:// output path, got {gcs_dir!r}")
 
     bucket_name, _, prefix = gcs_dir[5:].partition("/")
+    prefix = prefix.strip("/")
+
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     local_root = Path(local_dir)
 
-    for path in local_root.rglob("*"):
-        if path.is_file():
-            rel = path.relative_to(local_root).as_posix()
-            blob = bucket.blob(f"{prefix.rstrip('/')}/{rel}")
-            blob.upload_from_filename(str(path))
+    # Collect all file paths relative to the local root
+    files = [
+        str(p.relative_to(local_root))
+        for p in local_root.rglob("*") if p.is_file()
+    ]
+
+    transfer_manager.upload_many_from_filenames(
+        bucket,
+        files,
+        source_directory=local_dir,
+        blob_name_prefix=f"{prefix}/" if prefix else "",
+        worker_type=transfer_manager.THREAD,
+    )
 
 
 @kinetic.submit(
@@ -151,11 +163,11 @@ def run_slime_glm4_quickstart(num_rollout: int = 2):
 set -euxo pipefail
 cd /root/slime
 
-hf download zai-org/GLM-Z1-9B-0414 \
+huggingface-cli download zai-org/GLM-Z1-9B-0414 \
   --local-dir /root/GLM-Z1-9B-0414
-hf download --repo-type dataset zhuzilin/dapo-math-17k \
+huggingface-cli download --repo-type dataset zhuzilin/dapo-math-17k \
   --local-dir /root/dapo-math-17k
-hf download --repo-type dataset zhuzilin/aime-2024 \
+huggingface-cli download --repo-type dataset zhuzilin/aime-2024 \
   --local-dir /root/aime-2024
 
 source scripts/models/glm4-9B.sh
