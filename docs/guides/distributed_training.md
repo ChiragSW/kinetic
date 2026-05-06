@@ -62,8 +62,8 @@ def train_data_parallel():
 ```
 
 For a richer end-to-end example using a real model, see
-[`pathways_example.py`](examples.md) and
-[`gemma_sft_pathways_distributed.py`](examples.md).
+[`pathways_example.py`](../examples.md) and
+[`gemma_sft_pathways_distributed.py`](../examples.md).
 
 ## How to think about it
 
@@ -155,5 +155,5 @@ inspect non-leader logs to diagnose a crash.
 - [Accelerators](../accelerators.md) — slice topologies and naming.
 - [Checkpointing](checkpointing.md) — frequent checkpoints are
   essential here.
-- [Multiple Clusters](../advanced/clusters.md) — when to isolate
+- [Multiple Clusters](clusters.md) — when to isolate
   multi-host TPUs from the rest of your workloads.

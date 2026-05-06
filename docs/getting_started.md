@@ -128,12 +128,12 @@ python fashion_mnist.py
 
 After your first run works, the most useful follow-ups are:
 
-- [Examples](guides/examples.md): a catalog of runnable scripts that
+- [Examples](examples.md): a catalog of runnable scripts that
   cover async jobs, data, checkpoints, parallel sweeps, and LLM
   fine-tuning. The fastest way to see real patterns end to end.
 - [Execution Modes](guides/execution_modes.md): bundled vs prebuilt
   vs custom image, and when to switch.
-- [Detached Jobs](advanced/async_jobs.md): `@kinetic.submit()`,
+- [Detached Jobs](guides/async_jobs.md): `@kinetic.submit()`,
   reattach, and the job lifecycle for long-running work.
 - [Data](guides/data.md) and
   [Checkpointing](guides/checkpointing.md): `kinetic.Data(...)` for
