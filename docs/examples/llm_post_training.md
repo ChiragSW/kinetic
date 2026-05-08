@@ -146,8 +146,12 @@ def _upload_directory_to_gcs(local_dir: str, gcs_dir: str) -> None:
     base_image_repo=SLIME_BASE_REPO,
     capture_env_vars=["HF_TOKEN", "WANDB_*"],
 )
-def run_slime_glm4_quickstart(num_rollout: int = 2):
+def run_slime_glm4_quickstart(
+    num_rollout: int = 2,
+    resume_from: str | None = None,
+):
     import os
+    import shutil
     import subprocess
     from pathlib import Path
 
@@ -155,6 +159,9 @@ def run_slime_glm4_quickstart(num_rollout: int = 2):
     local_save = Path("/tmp/slime-output/GLM-Z1-9B-0414_slime")
     local_ref = Path("/tmp/slime-output/GLM-Z1-9B-0414_torch_dist")
     local_save.mkdir(parents=True, exist_ok=True)
+
+    if resume_from is not None:
+        shutil.copytree(resume_from, local_save, dirs_exist_ok=True)
 
     # Download the same model and datasets used by the upstream SLIME
     # quickstart. Keep them in /root because SLIME's example scripts use
@@ -222,6 +229,19 @@ The default `num_rollout=2` is a smoke run. Once the pod reaches the
 training loop and writes checkpoints successfully, raise it to the
 upstream value or your experiment target.
 
+To resume from an existing checkpoint prefix, pass it through
+`kinetic.Data(...)` at the call site. Kinetic resolves it to a regular
+path inside the pod before `run_slime_glm4_quickstart()` starts:
+
+```python
+job = run_slime_glm4_quickstart(
+    resume_from=kinetic.Data(
+        "gs://your-bucket/previous-run/GLM-Z1-9B-0414_slime/",
+        fuse=True,
+    ),
+)
+```
+
 :::{tip}
 Run this launcher from a small directory that only contains the launcher
 and `Dockerfile.slime`, or keep your `requirements.txt` minimal. The
@@ -284,16 +304,18 @@ paths together. SLIME model configs live under `/root/slime/scripts/models`.
 or maintain your own copy of the run script, then submit with
 `capture_env_vars=["WANDB_*"]`.
 
-- **Resume from a previous run:** Download the previous GCS checkpoint
-prefix into `local_save` before launching SLIME, or bake your own
-resume step into the wrapper. Megatron expects a filesystem checkpoint
-path, so stage remote checkpoints locally inside the pod before
+- **Resume from a previous run:** Pass the previous GCS checkpoint prefix
+with `kinetic.Data("gs://.../GLM-Z1-9B-0414_slime/", fuse=True)`, as
+shown above. Megatron expects a writable filesystem checkpoint path, so
+the wrapper copies the resolved `Data` path into `local_save` before
 starting the training script.
 
 - **Keep outputs durable during long runs:** The wrapper uploads after
 SLIME exits. For multi-hour jobs, add a background sync process or
 modify the run script to periodically copy completed checkpoint
-directories to `KINETIC_OUTPUT_DIR`.
+directories to `KINETIC_OUTPUT_DIR`. `Data(...)` is for inputs that
+exist before submission; it does not upload files created later inside
+the pod.
 
 ## Related pages
 
