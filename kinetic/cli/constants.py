@@ -11,12 +11,9 @@ RESOURCE_NAME_PREFIX = "kinetic"
 # Kubernetes service account used by kinetic workload pods.
 # Bound to the node GCP SA via Workload Identity Federation.
 KINETIC_KSA_NAME = "kinetic"
-STATE_DIR = os.environ.get(
-  "KINETIC_STATE_DIR",
-  os.path.expanduser("~/.kinetic/pulumi"),
-)
 PULUMI_ROOT = os.path.expanduser("~/.kinetic/pulumi-cli")
 PROFILES_FILE = os.path.expanduser("~/.kinetic/profiles.json")
+
 REQUIRED_APIS = [
   "compute.googleapis.com",
   "cloudbuild.googleapis.com",

@@ -87,6 +87,13 @@ kinetic up --project=my-project --accelerator=t4 --yes
 > down all resources and stop incurring costs. See the
 > [CLI Reference](cli) for the full set of commands.
 
+**Sharing infrastructure with teammates?** Kinetic stores Pulumi
+state in a per-project GCS bucket (`gs://{project}-kinetic-state`),
+so any teammate with `roles/storage.objectAdmin` on the bucket sees
+the same stack. The first `kinetic up` creates the bucket; the first
+admin needs `roles/storage.admin` on the project. See
+[Pulumi state](configuration.md#pulumi-state) for the full IAM story.
+
 ## Run your first job
 
 ```{literalinclude} ../examples/fashion_mnist.py

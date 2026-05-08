@@ -1,22 +1,19 @@
-"""kinetic config command — show/set configuration."""
+"""kinetic config command — show resolved configuration."""
 
 import os
 
 import click
 from rich.table import Table
 
-from kinetic.cli.constants import (
-  DEFAULT_CLUSTER_NAME,
-  DEFAULT_ZONE,
-  STATE_DIR,
-)
+from kinetic.cli.constants import DEFAULT_CLUSTER_NAME, DEFAULT_ZONE
+from kinetic.cli.infra.state_backend import state_backend_url
 from kinetic.cli.output import banner, console
 
 
 @click.group(invoke_without_command=True)
 @click.pass_context
 def config(ctx):
-  """Show or manage kinetic configuration."""
+  """Show kinetic configuration."""
   if ctx.invoked_subcommand is None:
     ctx.invoke(show)
 
@@ -93,22 +90,16 @@ def show(ctx):
     "KINETIC_OUTPUT_DIR" if output_dir else "",
   )
 
-  # State directory
-  state_dir = os.environ.get("KINETIC_STATE_DIR")
-  table.add_row(
-    "Pulumi State Dir",
-    state_dir or STATE_DIR,
-    "KINETIC_STATE_DIR" if state_dir else "default",
-  )
+  # Pulumi state lives in a GCS bucket derived from the project. Not
+  # configurable — shown as a fact so users know where to look.
+  if project:
+    table.add_row("Pulumi State", state_backend_url(project), "auto")
 
   console.print()
   console.print(table)
   console.print()
   console.print(
     "Precedence: CLI flag > KINETIC_* env var > active profile > default."
-  )
-  console.print(
-    "  https://kinetic.readthedocs.io/en/latest/configuration.html#precedence"
   )
   console.print("Manage profiles with 'kinetic profile create|ls|use|show|rm'.")
   console.print()

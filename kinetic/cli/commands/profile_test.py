@@ -437,6 +437,7 @@ class ProfileCreateEnvVarsTest(absltest.TestCase):
     self.assertEqual(data["profiles"]["dev"]["zone"], "env-zone")
     self.assertEqual(data["profiles"]["dev"]["cluster"], "env-cluster")
     self.assertEqual(data["profiles"]["dev"]["namespace"], "env-ns")
+    self.assertNotIn("state_backend", data["profiles"]["dev"])
 
   def test_flag_overrides_env_var(self):
     runner = CliRunner()

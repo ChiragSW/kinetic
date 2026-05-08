@@ -1,21 +1,22 @@
 """Pulumi Automation API wrapper for kinetic."""
 
-import os
-
 import click
 import pulumi.automation as auto
 
 from kinetic.cli.config import NodePoolConfig
-from kinetic.cli.constants import (
-  PULUMI_ROOT,
-  RESOURCE_NAME_PREFIX,
-  STATE_DIR,
+from kinetic.cli.constants import PULUMI_ROOT, RESOURCE_NAME_PREFIX
+from kinetic.cli.infra.state_backend import (
+  ensure_gcs_backend,
+  state_backend_url,
 )
 from kinetic.core import accelerators
 
 
 def get_stack(program_fn, config):
-  """Create or select a Pulumi stack with local file backend.
+  """Create or select a Pulumi stack on the GCS backend for ``config.project``.
+
+  The backend bucket is created on first use (idempotent), so any
+  state-touching command can be the first one a team member runs.
 
   Args:
       program_fn: Pulumi inline program callable.
@@ -24,7 +25,7 @@ def get_stack(program_fn, config):
   Returns:
       A pulumi.automation.Stack instance.
   """
-  os.makedirs(STATE_DIR, exist_ok=True)
+  ensure_gcs_backend(config.project)
 
   # Auto-install the Pulumi CLI if not already present.
   try:
@@ -40,7 +41,7 @@ def get_stack(program_fn, config):
   project_settings = auto.ProjectSettings(
     name=RESOURCE_NAME_PREFIX,
     runtime="python",
-    backend=auto.ProjectBackend(url=f"file://{STATE_DIR}"),
+    backend=auto.ProjectBackend(url=state_backend_url(config.project)),
   )
 
   stack = auto.create_or_select_stack(
