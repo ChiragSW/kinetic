@@ -3,9 +3,8 @@ import os
 import kinetic
 from kinetic import Data
 
-VERL_BASE_REPO = (
-  f"us-docker.pkg.dev/{os.environ['GOOGLE_CLOUD_PROJECT']}/kn-your-cluster-name"
-)
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "your-project-id")
+VERL_BASE_REPO = f"us-docker.pkg.dev/{PROJECT_ID}/kn-your-cluster-name"
 
 
 @kinetic.submit(
@@ -88,6 +87,8 @@ def run_verl_gsm8k_ppo(
 
 
 if __name__ == "__main__":
-  job = run_verl_gsm8k_ppo(Data("gs://your-bucket/verl-checkpoints/"))
+  job = run_verl_gsm8k_ppo(
+    Data("gs://your-bucket/verl-checkpoints/", fuse=True)
+  )
   print(f"Submitted Kinetic job: {job.job_id}")
   print(job.result())

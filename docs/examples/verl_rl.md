@@ -124,7 +124,7 @@ and the trainer still receives local parquet paths:
 
 ```python
 job = run_verl_gsm8k_ppo(
-    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/"),
+    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/", fuse=True),
     prepared_data_dir=kinetic.Data(
         "gs://your-project-id-kn-your-cluster-name-data/gsm8k/",
         fuse=True,
@@ -144,7 +144,7 @@ Pass the stable checkpoint prefix at the call site:
 
 ```python
 job = run_verl_gsm8k_ppo(
-    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/"),
+    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/", fuse=True),
 )
 ```
 
