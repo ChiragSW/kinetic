@@ -9,7 +9,7 @@ This guide shows how to run the SLIME quickstart from Kinetic. The key
 difference from a local SLIME run is the execution environment: SLIME
 ships patched Megatron/SGLang dependencies in its Docker image, so use
 that image as a Kinetic prebuilt GPU image and let Kinetic schedule,
-stream logs, and persist outputs.
+stream logs, and resolve checkpoint data with `kinetic.Data(...)`.
 
 :::{note}
 SLIME is a CUDA/GPU workflow, not a TPU workflow. Use Kinetic GPU
@@ -98,147 +98,23 @@ Use `@kinetic.submit()` for SLIME runs. RL post-training can run for
 hours, so a detached job is easier to inspect and clean up than a
 blocking `@kinetic.run()` call.
 
-Create `slime_quickstart.py`:
+Create `examples/llm_post_training.py`:
 
-```python
-import os
-from pathlib import Path
-
-import kinetic
-
-
-SLIME_BASE_REPO = "us-docker.pkg.dev/your-project-id/kinetic-slime"
-
-
-def _upload_directory_to_gcs(local_dir: str, gcs_dir: str) -> None:
-    from pathlib import Path
-    from google.cloud import storage
-    from google.cloud.storage import transfer_manager
-
-    if not gcs_dir.startswith("gs://"):
-        raise ValueError(f"Expected a gs:// output path, got {gcs_dir!r}")
-
-    bucket_name, _, prefix = gcs_dir[5:].partition("/")
-    prefix = prefix.strip("/")
-
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    local_root = Path(local_dir)
-
-    # Collect all file paths relative to the local root
-    files = [
-        str(p.relative_to(local_root))
-        for p in local_root.rglob("*") if p.is_file()
-    ]
-
-    transfer_manager.upload_many_from_filenames(
-        bucket,
-        files,
-        source_directory=local_dir,
-        blob_name_prefix=f"{prefix}/" if prefix else "",
-        worker_type=transfer_manager.THREAD,
-    )
-
-
-@kinetic.submit(
-    accelerator="gpu-h100x8",
-    container_image="prebuilt",
-    base_image_repo=SLIME_BASE_REPO,
-    capture_env_vars=["HF_TOKEN", "WANDB_*"],
-)
-def run_slime_glm4_quickstart(
-    num_rollout: int = 2,
-    resume_from: str | None = None,
-):
-    import os
-    import shutil
-    import subprocess
-    from pathlib import Path
-
-    output_dir = os.environ["KINETIC_OUTPUT_DIR"]
-    local_save = Path("/tmp/slime-output/GLM-Z1-9B-0414_slime")
-    local_ref = Path("/tmp/slime-output/GLM-Z1-9B-0414_torch_dist")
-    local_save.mkdir(parents=True, exist_ok=True)
-
-    if resume_from is not None:
-        shutil.copytree(resume_from, local_save, dirs_exist_ok=True)
-
-    # Download the same model and datasets used by the upstream SLIME
-    # quickstart. Keep them in /root because SLIME's example scripts use
-    # those paths by default.
-    setup = r"""
-set -euxo pipefail
-cd /root/slime
-
-huggingface-cli download zai-org/GLM-Z1-9B-0414 \
-  --local-dir /root/GLM-Z1-9B-0414
-huggingface-cli download --repo-type dataset zhuzilin/dapo-math-17k \
-  --local-dir /root/dapo-math-17k
-huggingface-cli download --repo-type dataset zhuzilin/aime-2024 \
-  --local-dir /root/aime-2024
-
-source scripts/models/glm4-9B.sh
-if [ ! -d /tmp/slime-output/GLM-Z1-9B-0414_torch_dist ]; then
-  PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
-    ${MODEL_ARGS[@]} \
-    --hf-checkpoint /root/GLM-Z1-9B-0414 \
-    --save /tmp/slime-output/GLM-Z1-9B-0414_torch_dist
-fi
-"""
-    subprocess.run(["bash", "-lc", setup], check=True)
-
-    # Patch the upstream convenience script for a short Kinetic smoke
-    # run and for durable local staging before upload to GCS.
-    script_path = Path("/root/slime/scripts/run-glm4-9B.sh")
-    run_script = script_path.read_text()
-    run_script = run_script.replace(
-        "--ref-load /root/GLM-Z1-9B-0414_torch_dist",
-        f"--ref-load {local_ref}",
-    )
-    run_script = run_script.replace(
-        "--load /root/GLM-Z1-9B-0414_slime/",
-        f"--load {local_save}/",
-    )
-    run_script = run_script.replace(
-        "--save /root/GLM-Z1-9B-0414_slime/",
-        f"--save {local_save}/",
-    )
-    run_script = run_script.replace(
-        "--num-rollout 3000",
-        f"--num-rollout {num_rollout}",
-    )
-
-    patched = Path("/tmp/run-glm4-9B-kinetic.sh")
-    patched.write_text(run_script)
-    patched.chmod(0o755)
-
-    subprocess.run(["bash", str(patched)], check=True)
-
-    gcs_save = f"{output_dir.rstrip('/')}/GLM-Z1-9B-0414_slime"
-    _upload_directory_to_gcs(str(local_save), gcs_save)
-    return {"checkpoints": gcs_save}
-
-
-if __name__ == "__main__":
-    job = run_slime_glm4_quickstart()
-    print(f"Submitted Kinetic job: {job.job_id}")
-    print(job.result())
+```{literalinclude} ../../examples/llm_post_training.py
+:language: python
 ```
 
 The default `num_rollout=2` is a smoke run. Once the pod reaches the
 training loop and writes checkpoints successfully, raise it to the
 upstream value or your experiment target.
 
-To resume from an existing checkpoint prefix, pass it through
-`kinetic.Data(...)` at the call site. Kinetic resolves it to a regular
-path inside the pod before `run_slime_glm4_quickstart()` starts:
+The checkpoint prefix is passed through `kinetic.Data(...)` at the call
+site. Kinetic resolves it to a regular path inside the pod before
+`run_slime_glm4_quickstart()` starts:
 
 ```python
 job = run_slime_glm4_quickstart(
-    resume_from=kinetic.Data(
-        "gs://your-bucket/previous-run/GLM-Z1-9B-0414_slime/",
-        fuse=True,
-    ),
+    Data("gs://your-bucket/slime-runs/GLM-Z1-9B-0414_slime/")
 )
 ```
 
@@ -263,15 +139,15 @@ then submits the Megatron/SGLang training job to that local Ray cluster.
 The Kinetic job is still the outer unit of scheduling, logging, and
 cleanup.
 
-When the function returns, the wrapper uploads the staged SLIME
-checkpoint directory to:
+When the function returns, the checkpoint directory is available at the
+path resolved from:
 
 ```text
-$KINETIC_OUTPUT_DIR/GLM-Z1-9B-0414_slime
+gs://your-bucket/slime-runs/GLM-Z1-9B-0414_slime/
 ```
 
-`KINETIC_OUTPUT_DIR` is a per-job GCS prefix created by Kinetic. See
-[Checkpointing](checkpointing.md) for retention and cleanup details.
+Use a stable GCS prefix for the `Data(...)` argument when you want later
+jobs to start from the same checkpoint tree.
 
 ## Scale the Quickstart
 
@@ -305,17 +181,14 @@ or maintain your own copy of the run script, then submit with
 `capture_env_vars=["WANDB_*"]`.
 
 - **Resume from a previous run:** Pass the previous GCS checkpoint prefix
-with `kinetic.Data("gs://.../GLM-Z1-9B-0414_slime/", fuse=True)`, as
-shown above. Megatron expects a writable filesystem checkpoint path, so
-the wrapper copies the resolved `Data` path into `local_save` before
-starting the training script.
+with `kinetic.Data("gs://.../GLM-Z1-9B-0414_slime/")`, as shown above.
+Kinetic resolves it to a filesystem path before starting the training
+script.
 
-- **Keep outputs durable during long runs:** The wrapper uploads after
-SLIME exits. For multi-hour jobs, add a background sync process or
-modify the run script to periodically copy completed checkpoint
-directories to `KINETIC_OUTPUT_DIR`. `Data(...)` is for inputs that
-exist before submission; it does not upload files created later inside
-the pod.
+- **Keep outputs durable during long runs:** Use a stable checkpoint
+prefix and follow the checkpointing patterns for your training stack.
+For multi-hour jobs, choose a checkpoint cadence that bounds how much
+work a restart would lose.
 
 ## Related pages
 
@@ -324,5 +197,4 @@ the pod.
   images and the `kinetic build-base` contract.
 - [Detached Jobs](../advanced/async_jobs.md) - monitor long-running
   `@kinetic.submit()` workloads.
-- [Checkpointing](checkpointing.md) - durable outputs via
-  `KINETIC_OUTPUT_DIR`.
+- [Checkpointing](checkpointing.md) - durable output patterns.
