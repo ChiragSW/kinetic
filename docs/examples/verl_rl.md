@@ -83,9 +83,9 @@ Build and publish it as the GPU prebuilt image for this Kinetic project:
 
 ```bash
 export GOOGLE_CLOUD_PROJECT="your-project-id"
-export KINETIC_VERL_REPO="us-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/kinetic-verl"
+export KINETIC_VERL_REPO="us-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/kn-your-cluster-name"
 
-gcloud artifacts repositories create kinetic-verl \
+gcloud artifacts repositories create kn-your-cluster-name \
   --repository-format=docker \
   --location=us \
   --project="${GOOGLE_CLOUD_PROJECT}"
@@ -107,139 +107,14 @@ Use `@kinetic.submit()` for RL runs. verl launches Ray workers inside the
 pod, and the outer Kinetic job remains the unit you monitor, clean up,
 and reattach to.
 
-Create `verl_gsm8k_ppo.py`:
+Create `examples/verl_rl.py`:
 
-```python
-import kinetic
-
-
-VERL_BASE_REPO = "us-docker.pkg.dev/your-project-id/kinetic-verl"
-
-
-def _upload_directory_to_gcs(local_dir: str, gcs_dir: str) -> None:
-    from pathlib import Path
-    from google.cloud import storage
-    from google.cloud.storage import transfer_manager
-
-    if not gcs_dir.startswith("gs://"):
-        raise ValueError(f"Expected a gs:// output path, got {gcs_dir!r}")
-
-    bucket_name, _, prefix = gcs_dir[5:].partition("/")
-    prefix = prefix.strip("/")
-
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    local_root = Path(local_dir)
-    files = [
-        str(path.relative_to(local_root))
-        for path in local_root.rglob("*")
-        if path.is_file()
-    ]
-
-    if files:
-        transfer_manager.upload_many_from_filenames(
-            bucket,
-            files,
-            source_directory=local_dir,
-            blob_name_prefix=f"{prefix}/" if prefix else "",
-            worker_type=transfer_manager.THREAD,
-        )
-
-
-@kinetic.submit(
-    accelerator="gpu-h100",
-    container_image="prebuilt",
-    base_image_repo=VERL_BASE_REPO,
-    capture_env_vars=["HF_TOKEN", "WANDB_*"],
-)
-def run_verl_gsm8k_ppo(
-    prepared_data_dir: str | None = None,
-    train_max_samples: int = 128,
-    val_max_samples: int = 128,
-    total_epochs: int = 1,
-    resume_from: str | None = None,
-):
-    import os
-    import shutil
-    import subprocess
-    from pathlib import Path
-
-    verl_dir = Path("/opt/verl")
-    data_dir = Path("/tmp/verl-data/gsm8k")
-    checkpoint_root = Path("/tmp/verl-checkpoints")
-    experiment_dir = checkpoint_root / "kinetic-verl" / "gsm8k-ppo"
-    output_dir = os.environ["KINETIC_OUTPUT_DIR"].rstrip("/")
-
-    if resume_from is not None:
-        shutil.copytree(resume_from, experiment_dir, dirs_exist_ok=True)
-
-    if prepared_data_dir is not None:
-        data_dir = Path(prepared_data_dir)
-    else:
-        subprocess.run(
-            [
-                "python3",
-                "examples/data_preprocess/gsm8k.py",
-                "--local_save_dir",
-                str(data_dir),
-            ],
-            cwd=verl_dir,
-            check=True,
-        )
-
-    command = [
-        "python3",
-        "-m",
-        "verl.trainer.main_ppo",
-        f"data.train_files={data_dir / 'train.parquet'}",
-        f"data.val_files={data_dir / 'test.parquet'}",
-        f"data.train_max_samples={train_max_samples}",
-        f"data.val_max_samples={val_max_samples}",
-        "data.train_batch_size=16",
-        "data.max_prompt_length=512",
-        "data.max_response_length=512",
-        "actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct",
-        "actor_rollout_ref.actor.optim.lr=1e-6",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
-        "actor_rollout_ref.rollout.name=vllm",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",
-        "critic.model.path=Qwen/Qwen2.5-0.5B-Instruct",
-        "critic.optim.lr=1e-5",
-        "critic.ppo_micro_batch_size_per_gpu=1",
-        "algorithm.kl_ctrl.kl_coef=0.001",
-        "trainer.project_name=kinetic-verl",
-        "trainer.experiment_name=gsm8k-ppo",
-        "trainer.logger=console",
-        "trainer.val_before_train=False",
-        "trainer.nnodes=1",
-        "trainer.n_gpus_per_node=1",
-        "trainer.save_freq=1",
-        "trainer.test_freq=5",
-        f"trainer.total_epochs={total_epochs}",
-        f"trainer.default_local_dir={experiment_dir}",
-        "trainer.default_hdfs_dir=null",
-        "trainer.resume_mode=auto",
-    ]
-
-    subprocess.run(command, cwd=verl_dir, check=True)
-
-    gcs_checkpoints = f"{output_dir}/checkpoints"
-    _upload_directory_to_gcs(str(checkpoint_root), gcs_checkpoints)
-    return {"checkpoints": gcs_checkpoints}
-
-
-if __name__ == "__main__":
-    job = run_verl_gsm8k_ppo()
-    print(f"Submitted Kinetic job: {job.job_id}")
-    print(job.result())
+```{literalinclude} ../../examples/verl_rl.py
+:language: python
 ```
 
 The defaults intentionally run on a small sample. Once the image,
-credentials, model download, Ray startup, and checkpoint upload all work,
+credentials, model download, Ray startup, and checkpoint writes all work,
 raise `train_max_samples`, `val_max_samples`, `trainer.total_epochs`,
 and the batch sizes for the real experiment.
 
@@ -249,8 +124,9 @@ and the trainer still receives local parquet paths:
 
 ```python
 job = run_verl_gsm8k_ppo(
+    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/"),
     prepared_data_dir=kinetic.Data(
-        "gs://your-bucket/verl-data/gsm8k/",
+        "gs://your-project-id-kn-your-cluster-name-data/gsm8k/",
         fuse=True,
     ),
 )
@@ -260,28 +136,23 @@ job = run_verl_gsm8k_ppo(
 
 verl's FSDP checkpoints are a directory tree under
 `trainer.default_local_dir`, with `latest_checkpointed_iteration.txt`
-tracking the latest saved step. Kinetic makes previous GCS outputs
-available to a new job through `kinetic.Data(...)`.
+tracking the latest saved step. The example passes the checkpoint root
+through `kinetic.Data(...)`, so Kinetic resolves the checkpoint prefix to
+a regular filesystem path before the job starts.
 
-Pass the previous checkpoint prefix at the call site:
+Pass the stable checkpoint prefix at the call site:
 
 ```python
 job = run_verl_gsm8k_ppo(
-    resume_from=kinetic.Data(
-        "gs://your-bucket/outputs/previous-job/checkpoints/kinetic-verl/gsm8k-ppo",
-        fuse=True,
-    ),
+    checkpoint_dir=kinetic.Data("gs://your-bucket/verl-checkpoints/"),
 )
 ```
 
-The function copies that resolved path into the local checkpoint
-directory before verl starts. With `trainer.resume_mode=auto`, verl
-resumes from the latest checkpoint found there.
+With `trainer.resume_mode=auto`, verl resumes from the latest checkpoint
+found under `kinetic-verl/gsm8k-ppo` inside that resolved directory.
 
-For long runs, upload checkpoints during training instead of only after
-the trainer exits. The simplest pattern is a small background sync that
-periodically copies completed `global_steps_*` directories from
-`checkpoint_root` to `KINETIC_OUTPUT_DIR`.
+For long runs, choose a checkpoint cadence that bounds how much work a
+restart would lose.
 
 ## Kinetic-specific Scaling Knobs
 
@@ -300,8 +171,8 @@ Keep these settings aligned when you scale beyond the smoke run:
   pod. For large prepared datasets, pass them with
   `kinetic.Data("gs://...", fuse=True)` rather than downloading them in
   the function.
-- `trainer.default_local_dir`: keep it on a writable local filesystem,
-  then copy durable artifacts to `KINETIC_OUTPUT_DIR`.
+- `trainer.default_local_dir`: keep it under the path resolved from
+  `kinetic.Data(...)` so resume logic sees the same checkpoint tree.
 - `capture_env_vars`: pass only the credentials the job needs, usually
   `HF_TOKEN` and optionally `WANDB_*`.
 
@@ -318,15 +189,12 @@ verl emits trainer metrics to the console when `trainer.logger=console`.
 If you switch to W&B, keep `capture_env_vars=["WANDB_*"]` and set the
 verl logger override accordingly.
 
-When the function returns, checkpoints are uploaded under:
+When the function returns, checkpoints are available under the resolved
+checkpoint path:
 
 ```text
-$KINETIC_OUTPUT_DIR/checkpoints
+gs://your-bucket/verl-checkpoints/kinetic-verl/gsm8k-ppo
 ```
-
-`KINETIC_OUTPUT_DIR` is a per-job GCS prefix created by Kinetic. See
-[Checkpointing](../guides/checkpointing.md) for retention and cleanup
-details.
 
 ## Related pages
 
@@ -335,5 +203,4 @@ details.
   and the `kinetic build-base` contract.
 - [Detached Jobs](../guides/async_jobs.md) - monitor long-running
   `@kinetic.submit()` workloads.
-- [Checkpointing](../guides/checkpointing.md) - durable outputs via
-  `KINETIC_OUTPUT_DIR`.
+- [Checkpointing](../guides/checkpointing.md) - durable output patterns.
