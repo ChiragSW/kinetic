@@ -76,6 +76,7 @@ def prepare_smoke_data(root: str | Path = "data/tunix_grpo_smoke") -> str:
 def run_tunix_grpo(
   data_dir: str,
   model_id: str = "google/gemma-3-270m-it",
+  tokenizer_path: str = "gs://gemma-data/tokenizers/tokenizer_gemma3.model",
   max_steps: int = 1,
   train_limit: int = 4,
   eval_limit: int = 2,
@@ -101,8 +102,6 @@ def run_tunix_grpo(
 
   output_dir = os.environ.get("KINETIC_OUTPUT_DIR", "/tmp/tunix-grpo")
   checkpoint_dir = f"{output_dir.rstrip('/')}/checkpoints"
-
-  tokenizer_path = "gs://gemma-data/tokenizers/tokenizer_gemma3.model"
 
   reasoning_start = "<reasoning>"
   reasoning_end = "</reasoning>"
@@ -155,7 +154,7 @@ def run_tunix_grpo(
 
   num_tpus = len(jax.devices())
   if num_tpus == 8:
-    mesh_shape = (1, 4)
+    mesh_shape = (2, 4)
   elif num_tpus in (1, 4):
     mesh_shape = (1, num_tpus)
   else:
