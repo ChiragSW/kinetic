@@ -98,9 +98,9 @@ Use `@kinetic.submit()` for SLIME runs. RL post-training can run for
 hours, so a detached job is easier to inspect and clean up than a
 blocking `@kinetic.run()` call.
 
-Create `examples/llm_post_training.py`:
+Create `examples/slime_post_training.py`:
 
-```{literalinclude} ../../examples/llm_post_training.py
+```{literalinclude} ../../examples/slime_post_training.py
 :language: python
 ```
 

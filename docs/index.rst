@@ -33,7 +33,7 @@ Kinetic: Run ML workloads on cloud TPUs and GPUs
    examples/pytorch_training
    examples/gemma4_finetuning
    examples/llm_finetuning
-   examples/llm_post_training
+   examples/slime_post_training
    examples
 
 .. toctree::
